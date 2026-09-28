@@ -6,6 +6,7 @@
 
 use glassine::config::{Config, MonitorSelector, Overrides};
 use glassine::geometry::resolve_rect;
+use glassine::logging;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -32,6 +33,23 @@ struct Args {
 fn run(raw: &[String]) -> Result<(), String> {
     let args = parse_args(raw)?;
     let (config, path) = resolve(&args)?;
+
+    if let Err(error) = logging::init(config.log.level) {
+        // Logging is a diagnostic, not a correctness requirement: a sticky note
+        // must still run where the log directory is not writable. Same posture
+        // the spec takes for a tray icon that fails to register.
+        eprintln!("glassine: cannot start file logging: {error}");
+    }
+    // The spec's configuration-effective rule depends on this line: it is how
+    // "were my edits loaded?" is answered without guessing.
+    log::info!(
+        "glassine {} start config={} mtime={} port={}",
+        env!("CARGO_PKG_VERSION"),
+        path.display(),
+        mtime(&path),
+        config.server.port
+    );
+
     print!("{}", report(&config, &path));
     Ok(())
 }
