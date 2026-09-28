@@ -8,6 +8,7 @@
 //! visible rather than dead code until a later task wires it up.
 
 pub mod config;
+pub mod content;
 pub mod geometry;
 pub mod logging;
 pub mod platform;
