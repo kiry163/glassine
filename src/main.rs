@@ -1,23 +1,51 @@
-//! `glassine`: argument handling, diagnostics, and the window host.
+//! `glassine`: argument handling, diagnostics, and the host for the window and
+//! the HTTP server.
 
 #![windows_subsystem = "windows"]
 
 use glassine::app::App;
 use glassine::config::{Config, Overrides};
+use glassine::http;
 use glassine::logging;
 use glassine::platform::win::{self, LayeredWindow};
 use glassine::window_state;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+/// Configuration was rejected (spec 13).
+const EXIT_CONFIG: u8 = 2;
+/// The port was taken. The spec forbids silently choosing another one.
+const EXIT_PORT: u8 = 3;
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     match run(&raw) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("glassine: {message}");
-            ExitCode::from(2)
+        Err(failure) => {
+            eprintln!("glassine: {}", failure.message);
+            ExitCode::from(failure.exit_code)
+        }
+    }
+}
+
+/// A failure with the exit code the spec assigns its category.
+struct Failure {
+    exit_code: u8,
+    message: String,
+}
+
+impl Failure {
+    fn config(message: impl Into<String>) -> Failure {
+        Failure { exit_code: EXIT_CONFIG, message: message.into() }
+    }
+
+    fn port(error: http::BindError) -> Failure {
+        Failure {
+            exit_code: EXIT_PORT,
+            message: format!("cannot listen on 127.0.0.1: {error}"),
         }
     }
 }
@@ -33,7 +61,7 @@ struct Args {
     smoke_ms: Option<u64>,
 }
 
-fn run(raw: &[String]) -> Result<(), String> {
+fn run(raw: &[String]) -> Result<(), Failure> {
     let args = parse_args(raw)?;
     let (config, path) = resolve(&args)?;
 
@@ -62,7 +90,7 @@ fn run(raw: &[String]) -> Result<(), String> {
     run_window(config, state_path, args.smoke_ms)
 }
 
-fn run_window(config: Config, state_path: PathBuf, smoke_ms: Option<u64>) -> Result<(), String> {
+fn run_window(config: Config, state_path: PathBuf, smoke_ms: Option<u64>) -> Result<(), Failure> {
     let monitors = win::enumerate_monitors();
     let (work_area, device_name) = win::resolve_work_area(&config.window.monitor, &monitors);
 
@@ -77,8 +105,13 @@ fn run_window(config: Config, state_path: PathBuf, smoke_ms: Option<u64>) -> Res
         saved,
     );
 
+    // Bound before the window exists, so a port conflict cannot flash a window
+    // and then fail.
+    let server = http::Server::bind(config.server.port).map_err(Failure::port)?;
+    log::info!("http: listening on 127.0.0.1:{}", server.local_port());
+
     let window = LayeredWindow::create(&config.window, rect)
-        .map_err(|error| format!("cannot create the window: {error}"))?;
+        .map_err(|error| Failure::config(format!("cannot create the window: {error}")))?;
     log::info!(
         "window created hwnd={:?} dpi={} monitor={} work_area={},{},{},{} rect={},{},{},{} position_source={:?}",
         window.hwnd(),
@@ -95,8 +128,12 @@ fn run_window(config: Config, state_path: PathBuf, smoke_ms: Option<u64>) -> Res
         source
     );
 
+    // The handle travels as an `isize`: no `windows` type crosses to the HTTP
+    // thread, which only has to be able to post one message.
+    let handle = window.hwnd().0 as isize;
     let mut app = App::new(config, window, state_path);
     app.set_position_source(source);
+
     let tick_ms = app.tick_interval_ms();
     if let Some(window) = app.window_mut() {
         window.set_tick_interval(tick_ms);
@@ -105,28 +142,36 @@ fn run_window(config: Config, state_path: PathBuf, smoke_ms: Option<u64>) -> Res
         }
     }
 
+    let commands = app.command_sender();
+    let status = app.shared_status();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let wake: Box<dyn Fn() + Send> = Box::new(move || win::wake(handle));
+    std::thread::spawn(move || server.serve(commands, status, wake, shutdown));
+
     app.redraw();
     app.run();
     app.shutdown();
     Ok(())
 }
 
-fn parse_args(raw: &[String]) -> Result<Args, String> {
+fn parse_args(raw: &[String]) -> Result<Args, Failure> {
     let mut args = Args::default();
     let mut index = 0;
     while index < raw.len() {
         match raw[index].as_str() {
-            "--config" => args.config = Some(PathBuf::from(flag_value(raw, &mut index)?)),
-            "--port" => args.port = Some(flag_value(raw, &mut index)?.to_string()),
-            "--log-level" => args.log_level = Some(flag_value(raw, &mut index)?.to_string()),
+            "--config" => {
+                args.config = Some(PathBuf::from(flag_value(raw, &mut index).map_err(Failure::config)?))
+            }
+            "--port" => args.port = Some(flag_value(raw, &mut index).map_err(Failure::config)?.to_string()),
+            "--log-level" => {
+                args.log_level = Some(flag_value(raw, &mut index).map_err(Failure::config)?.to_string())
+            }
             "--check-config" => args.check_config = true,
             "--smoke-ms" => {
-                let value = flag_value(raw, &mut index)?;
-                args.smoke_ms = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("--smoke-ms needs a number of milliseconds, got {value:?}"))?,
-                );
+                let value = flag_value(raw, &mut index).map_err(Failure::config)?;
+                args.smoke_ms = Some(value.parse().map_err(|_| {
+                    Failure::config(format!("--smoke-ms needs a number of milliseconds, got {value:?}"))
+                })?);
             }
             other => eprintln!("glassine: ignoring unknown argument {other}"),
         }
@@ -147,23 +192,23 @@ fn flag_value<'a>(raw: &'a [String], index: &mut usize) -> Result<&'a str, Strin
 /// the file, then the environment, then the command line. Every layer goes
 /// through the same validators, so a bad override fails with the same field
 /// name a bad file would.
-fn resolve(args: &Args) -> Result<(Config, PathBuf), String> {
+fn resolve(args: &Args) -> Result<(Config, PathBuf), Failure> {
     let path = args
         .config
         .clone()
         .or_else(|| std::env::var_os("GLASSINE_CONFIG").map(PathBuf::from))
         .unwrap_or_else(Config::config_path);
 
-    let mut config = Config::load(&path).map_err(|error| error.to_string())?;
+    let mut config = Config::load(&path).map_err(|error| Failure::config(error.to_string()))?;
     config
         .apply(&Overrides {
             port: std::env::var("GLASSINE_PORT").ok(),
             log_level: std::env::var("GLASSINE_LOG").ok(),
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| Failure::config(error.to_string()))?;
     config
         .apply(&Overrides { port: args.port.clone(), log_level: args.log_level.clone() })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| Failure::config(error.to_string()))?;
 
     Ok((config, path))
 }

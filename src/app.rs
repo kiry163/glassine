@@ -11,12 +11,45 @@ use crate::status::StatusSnapshot;
 use crate::window_state::PositionSource;
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 /// What a redraw produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RedrawOutcome {
     /// Whether content did not fit and was cut off.
     pub truncated: bool,
+}
+
+/// What the window last reported about itself.
+///
+/// Cached rather than asked for on demand: while the message loop runs the
+/// window is checked out of [`App`], and spec 9.2 requires `/status` to be
+/// answerable without involving the window thread at all.
+struct WindowFacts {
+    rect: Rect,
+    monitor_name: String,
+    dpi: u32,
+}
+
+impl WindowFacts {
+    fn of(window: &LayeredWindow) -> WindowFacts {
+        WindowFacts {
+            rect: window.rect(),
+            monitor_name: window.monitor_name(),
+            dpi: window.dpi(),
+        }
+    }
+
+    /// With no window there is nothing to measure: the configured size at the
+    /// origin is the only honest answer, and no monitor to name.
+    fn headless(config: &Config) -> WindowFacts {
+        WindowFacts {
+            rect: Rect { x: 0, y: 0, width: config.window.size.0, height: config.window.size.1 },
+            monitor_name: String::new(),
+            dpi: 0,
+        }
+    }
 }
 
 pub struct App {
@@ -40,6 +73,15 @@ pub struct App {
     last_truncated: bool,
     /// Which authority placed the window, on the snapshot's advice.
     position_source: PositionSource,
+    /// The queue the HTTP thread fills and `on_wake` drains, in order.
+    commands: Receiver<Command>,
+    /// The sending half, handed to the server.
+    command_sender: Sender<Command>,
+    /// The snapshot `/status` reads, published on every refresh so the HTTP
+    /// thread never has to ask the window thread anything.
+    shared_status: Arc<Mutex<StatusSnapshot>>,
+    /// What the window last said about itself.
+    window_facts: WindowFacts,
 }
 
 impl App {
@@ -57,7 +99,13 @@ impl App {
         let state = ContentState::new();
         let clock = Clock::from_config(&config.clock);
         let engine = TextEngine::new(&config.text);
-        let status = snapshot_of(&config, &state, window.as_ref(), PositionSource::Config, false);
+        let window_facts = match window.as_ref() {
+            Some(window) => WindowFacts::of(window),
+            None => WindowFacts::headless(&config),
+        };
+        let status = snapshot_of(&state, &window_facts, PositionSource::Config, false);
+        let (command_sender, commands) = mpsc::channel();
+        let shared_status = Arc::new(Mutex::new(status.clone()));
 
         App {
             config,
@@ -72,6 +120,28 @@ impl App {
             stopped: false,
             last_truncated: false,
             position_source: PositionSource::Config,
+            commands,
+            command_sender,
+            shared_status,
+            window_facts,
+        }
+    }
+
+    /// The sending half of the command queue, for the HTTP server.
+    pub fn command_sender(&self) -> Sender<Command> {
+        self.command_sender.clone()
+    }
+
+    /// The snapshot the HTTP thread reads.
+    pub fn shared_status(&self) -> Arc<Mutex<StatusSnapshot>> {
+        Arc::clone(&self.shared_status)
+    }
+
+    /// Drains the queue the HTTP thread fills, applying commands in arrival
+    /// order (spec 9.4: a later caller wins).
+    pub fn apply_pending_commands(&mut self) {
+        while let Ok(command) = self.commands.try_recv() {
+            self.apply_command(command);
         }
     }
 
@@ -144,6 +214,9 @@ impl App {
     }
 
     fn redraw_into(&mut self, window: &mut LayeredWindow) {
+        // The window is only reachable here, so this is where its facts are
+        // collected for `/status`.
+        self.window_facts = WindowFacts::of(window);
         let rect = window.rect();
         let outcome = self.render_into(window.pixels_mut(), rect.width, rect.height);
         if outcome.truncated {
@@ -201,41 +274,38 @@ impl App {
 
     fn refresh_status(&mut self) {
         let status = snapshot_of(
-            &self.config,
             &self.state,
-            self.window.as_ref(),
+            &self.window_facts,
             self.position_source,
             self.last_truncated,
         );
         self.status = status;
+        publish(&self.shared_status, &self.status);
+    }
+}
+
+/// Hands the snapshot to the HTTP thread, recovering from a poisoned lock: the
+/// snapshot is plain data, so poisoning says nothing about its validity.
+fn publish(shared: &Arc<Mutex<StatusSnapshot>>, snapshot: &StatusSnapshot) {
+    match shared.lock() {
+        Ok(mut guard) => *guard = snapshot.clone(),
+        Err(poisoned) => *poisoned.into_inner() = snapshot.clone(),
     }
 }
 
 /// Builds the snapshot from the pieces, so construction and every later refresh
 /// cannot drift apart.
 fn snapshot_of(
-    config: &Config,
     state: &ContentState,
-    window: Option<&LayeredWindow>,
+    facts: &WindowFacts,
     position_source: PositionSource,
     last_truncated: bool,
 ) -> StatusSnapshot {
-    let (window_rect, monitor_name, dpi) = match window {
-        Some(window) => (window.rect(), window.monitor_name(), window.dpi()),
-        // Headless: no window to measure, so the configured size at the origin
-        // is the only honest answer, and there is no monitor to name.
-        None => (
-            Rect { x: 0, y: 0, width: config.window.size.0, height: config.window.size.1 },
-            String::new(),
-            0,
-        ),
-    };
-
     StatusSnapshot {
         mode: state.mode(),
-        window: window_rect,
-        monitor_name,
-        dpi,
+        window: facts.rect,
+        monitor_name: facts.monitor_name.clone(),
+        dpi: facts.dpi,
         // The spec pins this to `false` outside text mode: a truncated clock
         // line is not caller content going missing.
         truncated: state.mode() == Mode::Text && last_truncated,
@@ -256,18 +326,27 @@ impl WindowEvents for App {
         self.refresh_status();
     }
 
-    fn on_wake(&mut self, _window: &mut LayeredWindow) {}
+    fn on_wake(&mut self, window: &mut LayeredWindow) {
+        self.apply_pending_commands();
+        // A wake means work arrived, so redraw now rather than at the next tick:
+        // that immediacy is the whole point of the wake-up path.
+        if !self.stopped {
+            self.redraw_into(window);
+        }
+    }
 
     fn on_dpi_changed(&mut self, window: &mut LayeredWindow, dpi: u32) {
         // The anchor is resolved in physical pixels, so a new DPI means the
         // window has to be placed again rather than merely redrawn.
         log::info!("window: dpi changed to {dpi}");
-        let _ = window;
+        self.window_facts = WindowFacts::of(window);
+        self.refresh_status();
     }
 
     fn on_display_change(&mut self, window: &mut LayeredWindow) {
-        let _ = window;
         log::info!("window: display configuration changed");
+        self.window_facts = WindowFacts::of(window);
+        self.refresh_status();
     }
 
     fn on_quit_requested(&mut self, _window: &mut LayeredWindow) {

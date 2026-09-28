@@ -449,6 +449,24 @@ impl LayeredWindow {
     }
 }
 
+/// Posts the wake-up the HTTP thread uses to make the window thread drain its
+/// queue (spec §12).
+///
+/// Takes the handle as an `isize` so that no `windows` type crosses a thread
+/// boundary: the handle value is all the HTTP thread needs.
+pub fn wake(handle: isize) {
+    // SAFETY: posting is safe from any thread. If the window is already gone the
+    // call fails harmlessly rather than faulting.
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(handle as *mut core::ffi::c_void)),
+            WM_APP + 1,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
 /// The primary monitor's work area, i.e. its bounds minus the taskbar.
 ///
 /// `SPI_GETWORKAREA` reports the primary display only; `enumerate_monitors` is

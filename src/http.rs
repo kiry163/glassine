@@ -1,9 +1,27 @@
-//! HTTP framing, routing, and the response envelopes.
+//! HTTP framing, routing, the response envelopes, and the server that ties them
+//! to the window thread.
 
+use crate::content::{Command, ContentState};
 use crate::status::{mode_name, StatusSnapshot};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::fmt;
 
 /// The body ceiling from the spec, used by the server that calls this.
 pub const MAX_BODY_BYTES: usize = 65536;
+
+/// How long a client may take to finish a request, and to receive an answer
+/// (spec 9.4). One stuck caller blocks the others for at most this long.
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A request head larger than this is not worth waiting for; it is handed to
+/// `parse_request`, which reports it as malformed.
+const MAX_HEAD_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -227,6 +245,287 @@ fn payload_too_large(max_body: usize) -> HttpError {
         code: "payload_too_large",
         message: format!("body exceeds {max_body} bytes"),
     }
+}
+
+fn timeout() -> HttpError {
+    HttpError {
+        status: 408,
+        code: "timeout",
+        message: "the request was not finished within 2 seconds".to_string(),
+    }
+}
+
+impl Action {
+    /// The command this action delivers, or `None` for the read-only `Status`.
+    pub fn command(&self) -> Option<Command> {
+        match self {
+            Action::SetText(text) => Some(Command::SetText(text.clone())),
+            Action::SetTime => Some(Command::SetTime),
+            Action::Quit => Some(Command::Quit),
+            Action::Status => None,
+        }
+    }
+}
+
+/// Why the listening socket could not be opened.
+#[derive(Debug)]
+pub enum BindError {
+    /// The port is taken. The spec refuses to pick another one.
+    InUse,
+    Other(io::Error),
+}
+
+impl fmt::Display for BindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BindError::InUse => f.write_str("the port is already in use"),
+            BindError::Other(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for BindError {}
+
+/// The listening socket. It binds early so that a port conflict fails before a
+/// window is ever created.
+pub struct Server {
+    listener: TcpListener,
+}
+
+impl Server {
+    pub fn bind(port: u16) -> Result<Server, BindError> {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => Ok(Server { listener }),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => Err(BindError::InUse),
+            Err(error) => Err(BindError::Other(error)),
+        }
+    }
+
+    pub fn local_port(&self) -> u16 {
+        self.listener.local_addr().map(|address| address.port()).unwrap_or(0)
+    }
+
+    /// Serves connections until `shutdown` is set.
+    ///
+    /// One connection at a time, on the calling thread: the spec's concurrency
+    /// model is a serial caller, so a queue of connections would add threads
+    /// without adding capability.
+    pub fn serve(
+        self,
+        commands: Sender<Command>,
+        status: Arc<Mutex<StatusSnapshot>>,
+        wake: Box<dyn Fn() + Send>,
+        shutdown: Arc<AtomicBool>,
+    ) {
+        // Non-blocking so the shutdown flag is noticed between connections.
+        if let Err(error) = self.listener.set_nonblocking(true) {
+            log::error!("http: cannot poll the listener: {error}");
+            return;
+        }
+
+        while !shutdown.load(Ordering::Relaxed) {
+            match self.listener.accept() {
+                Ok((stream, _)) => Self::handle(stream, &commands, &status, &wake),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    log::warn!("http: accept failed: {error}");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        log::info!("http: stopped listening");
+    }
+
+    fn handle(
+        mut stream: TcpStream,
+        commands: &Sender<Command>,
+        status: &Arc<Mutex<StatusSnapshot>>,
+        wake: &(dyn Fn() + Send),
+    ) {
+        // Windows accepted sockets inherit the listener's non-blocking mode,
+        // which would make every read return immediately. The listener polls so
+        // that it can notice shutdown; the connection itself must still block,
+        // up to its timeout, or every request split across more than one TCP
+        // segment would be cut off mid-read.
+        if let Err(error) = stream.set_nonblocking(false) {
+            log::warn!("http: cannot put the connection in blocking mode: {error}");
+            return;
+        }
+        let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+
+        let response = match read_request(&mut stream) {
+            Ok(raw) => Self::answer(&raw, commands, status, wake),
+            Err(ReadFailure::TimedOut) => response_for(&timeout()),
+            // A caller that hung up mid-request is not owed an answer, and the
+            // spec says the window is unaffected either way.
+            Err(ReadFailure::Closed) => return,
+        };
+
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        // The stream closes here, which is what tells the caller the body ended.
+    }
+
+    /// Builds the answer, writes nothing, and delivers the command only once
+    /// the caller has been answered.
+    fn answer(
+        raw: &[u8],
+        commands: &Sender<Command>,
+        status: &Arc<Mutex<StatusSnapshot>>,
+        wake: &(dyn Fn() + Send),
+    ) -> String {
+        let action = match parse_request(raw, MAX_BODY_BYTES).and_then(|request| route(&request)) {
+            Ok(action) => action,
+            Err(error) => return response_for(&error),
+        };
+
+        let snapshot = locked(status);
+        let response = response_for_body(200, &success_body(&action, &snapshot_after(&action, &snapshot)));
+        log::info!("http: {} -> 200", endpoint_of(&action));
+
+        // Spec 9.2 is explicit about `/quit`: the response is written and
+        // flushed first, or the caller sees a reset instead of an answer. The
+        // same order is harmless for the other actions and simpler than
+        // special-casing one of them, so the caller writes, then this returns
+        // the command for delivery.
+        if let Some(command) = action.command() {
+            if commands.send(command).is_err() {
+                // The window thread is gone; nothing left to command.
+                return response;
+            }
+            wake();
+        }
+        response
+    }
+}
+
+/// The snapshot, copied out so the lock is held for one clone and `/status`
+/// never blocks the window thread.
+fn locked(status: &Arc<Mutex<StatusSnapshot>>) -> StatusSnapshot {
+    match status.lock() {
+        Ok(guard) => guard.clone(),
+        // The snapshot is plain data, so poisoning says nothing about its
+        // validity: recover rather than lose `/status`.
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// What the snapshot will say once the action has been applied.
+///
+/// The rule is taken from `ContentState` itself rather than restated, so the
+/// answer a caller receives cannot disagree with what the window will show.
+fn snapshot_after(action: &Action, snapshot: &StatusSnapshot) -> StatusSnapshot {
+    let Some(command) = action.command() else {
+        return snapshot.clone();
+    };
+    let mut state = ContentState::new();
+    state.apply(&command);
+
+    let mut result = snapshot.clone();
+    result.mode = state.mode();
+    result
+}
+
+fn endpoint_of(action: &Action) -> &'static str {
+    match action {
+        Action::SetText(_) => "/text",
+        Action::SetTime => "/time",
+        Action::Quit => "/quit",
+        Action::Status => "/status",
+    }
+}
+
+fn response_for(error: &HttpError) -> String {
+    response_for_body(error.status, &error_body(error))
+}
+
+fn response_for_body(status: u16, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        reason(status),
+        body.len()
+    )
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Payload Too Large",
+        _ => "Internal Server Error",
+    }
+}
+
+enum ReadFailure {
+    /// The client announced more than it sent, and the timeout expired.
+    TimedOut,
+    /// The client went away, or the stream failed.
+    Closed,
+}
+
+/// Reads one request: up to the head terminator, then exactly the declared body.
+fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>, ReadFailure> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        if let Some(boundary) = header_end(&buffer) {
+            match declared_length(&buffer[..boundary]) {
+                // Refused without waiting for the body it promises:
+                // `parse_request` turns this into a 413.
+                Some(declared) if declared > MAX_BODY_BYTES => {
+                    return Ok(buffer[..boundary + 4].to_vec())
+                }
+                Some(declared) if buffer.len() >= boundary + 4 + declared => return Ok(buffer),
+                Some(_) => {}
+                // No `Content-Length`: the head is the whole request.
+                None => return Ok(buffer[..boundary + 4].to_vec()),
+            }
+        } else if buffer.len() > MAX_HEAD_BYTES {
+            // Hand it over as-is; `parse_request` reports the missing separator.
+            return Ok(buffer);
+        }
+
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(ReadFailure::Closed),
+            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                return Err(ReadFailure::TimedOut)
+            }
+            // A non-blocking connection reports this instead of timing out.
+            // `handle` puts every connection in blocking mode, so reaching here
+            // means that mode was lost, which is worth saying out loud.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                log::warn!("http: the connection is not in blocking mode: {error}");
+                return Err(ReadFailure::TimedOut);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(ReadFailure::Closed),
+        }
+    }
+}
+
+/// The offset of the header/body separator, absent when the head is incomplete.
+fn header_end(raw: &[u8]) -> Option<usize> {
+    raw.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+/// The `Content-Length` a head declares, absent when it declares none.
+fn declared_length(head: &[u8]) -> Option<usize> {
+    let head = std::str::from_utf8(head).ok()?;
+    head.split("\r\n").skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
 }
 
 #[cfg(test)]
