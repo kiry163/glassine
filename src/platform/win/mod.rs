@@ -86,19 +86,24 @@ pub struct MonitorInfo {
 
 /// Everything the window reports to its owner.
 ///
+/// Every callback receives the window, because the loop owns it while it runs:
+/// the handler cannot reach a window it does not own, and the alternative — a
+/// self-referential pointer from the handler back to the loop's window — would
+/// put two mutable paths to the same window in play.
+///
 /// There is deliberately no `on_command`: the window has no channel to drain,
 /// and the queue belongs to the application (spec: thread model). A wake-up is
 /// all this layer can honestly deliver.
 pub trait WindowEvents {
     /// A scheduled redraw is due.
-    fn on_tick(&mut self);
+    fn on_tick(&mut self, window: &mut LayeredWindow);
     /// The HTTP thread has queued work; drain it.
-    fn on_wake(&mut self);
-    fn on_dpi_changed(&mut self, dpi: u32);
-    fn on_display_change(&mut self);
+    fn on_wake(&mut self, window: &mut LayeredWindow);
+    fn on_dpi_changed(&mut self, window: &mut LayeredWindow, dpi: u32);
+    fn on_display_change(&mut self, window: &mut LayeredWindow);
     /// The window is being destroyed; release anything tied to its lifetime,
     /// such as the tray icon.
-    fn on_quit_requested(&mut self);
+    fn on_quit_requested(&mut self, window: &mut LayeredWindow);
 }
 
 /// Window state the `wndproc` owns and mutates.
@@ -106,6 +111,8 @@ pub trait WindowEvents {
 /// Kept separate from [`LayeredWindow`] so that the `wndproc` never has to
 /// reach through the `&mut LayeredWindow` held by `run_message_loop`.
 struct MessageContext {
+    /// The window the loop owns while it runs, so callbacks can be handed it.
+    window: Cell<*mut LayeredWindow>,
     handler: Cell<Option<*mut (dyn WindowEvents + 'static)>>,
     /// The origin `present` draws at. Also the authority `set_position`
     /// updates, so the two cannot drift apart.
@@ -126,7 +133,12 @@ pub struct LayeredWindow {
     /// Start of the DIB's pixels; valid until `destroy` deletes the bitmap.
     bits: *mut u8,
     rect: Rect,
-    context: Box<MessageContext>,
+    /// Owns the message state; never read directly, only through `context`.
+    _context: Box<MessageContext>,
+    /// The single path every access to the message state takes — this type's and
+    /// the `wndproc`'s alike. A second path would be a second borrow of the same
+    /// state, which is what this arrangement exists to avoid.
+    context: *mut MessageContext,
 }
 
 impl LayeredWindow {
@@ -163,7 +175,8 @@ impl LayeredWindow {
                 None,
             )?;
 
-            let context = Box::new(MessageContext {
+            let mut context = Box::new(MessageContext {
+                window: Cell::new(std::ptr::null_mut()),
                 handler: Cell::new(None),
                 origin: Cell::new((rect.x, rect.y)),
                 dpi: Cell::new(GetDpiForWindow(hwnd)),
@@ -171,7 +184,10 @@ impl LayeredWindow {
                 move_mode: Cell::new(false),
                 click_through: Cell::new(true),
             });
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, &*context as *const MessageContext as isize);
+            // Derived from a mutable borrow, so later writes through it — the
+            // `wndproc`'s included — are legitimate.
+            let context_pointer: *mut MessageContext = &mut *context;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, context_pointer as isize);
 
             let screen_dc = GetDC(None);
             let mem_dc = CreateCompatibleDC(Some(screen_dc));
@@ -208,9 +224,20 @@ impl LayeredWindow {
                 old_bitmap,
                 bits: bits as *mut u8,
                 rect,
-                context,
+                _context: context,
+                context: context_pointer,
             })
         }
+    }
+
+    /// The message state, reached through the one pointer that owns it.
+    fn state(&self) -> &mut MessageContext {
+        // SAFETY: `context` points into the boxed state this window owns, which
+        // lives until `destroy` consumes the window. Every access — here and in
+        // the `wndproc` — uses that same pointer, so no second borrow of that
+        // state can exist. The window's own fields live in a different
+        // allocation, so borrowing them does not disturb this one.
+        unsafe { &mut *self.context }
     }
 
     pub fn hwnd(&self) -> HWND {
@@ -222,11 +249,19 @@ impl LayeredWindow {
     }
 
     pub fn origin(&self) -> (i32, i32) {
-        self.context.origin.get()
+        self.state().origin.get()
     }
 
     pub fn dpi(&self) -> u32 {
-        self.context.dpi.get()
+        self.state().dpi.get()
+    }
+
+    /// Asks the window to close, exactly as closing it by hand would.
+    pub fn close(&self) {
+        // SAFETY: `hwnd` is alive, and posting a message is safe from any thread.
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
     }
 
     pub fn monitor_name(&self) -> String {
@@ -247,7 +282,7 @@ impl LayeredWindow {
     }
 
     pub fn present(&mut self) -> Result<(), PlatformError> {
-        let (x, y) = self.context.origin.get();
+        let (x, y) = self.state().origin.get();
         let size = SIZE { cx: self.rect.width as i32, cy: self.rect.height as i32 };
         let source = POINT { x: 0, y: 0 };
         let destination = POINT { x, y };
@@ -281,7 +316,7 @@ impl LayeredWindow {
     /// `WindowFromPoint` read the window's own position. Updating only one of
     /// them makes the next redraw yank the window back.
     pub fn set_position(&mut self, x: i32, y: i32) {
-        self.context.origin.set((x, y));
+        self.state().origin.set((x, y));
         // SAFETY: `hwnd` is alive, and the flags keep size, z-order and focus
         // untouched.
         unsafe {
@@ -316,7 +351,7 @@ impl LayeredWindow {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
         }
-        self.context.click_through.set(enabled);
+        self.state().click_through.set(enabled);
     }
 
     /// Re-asserts `WS_EX_TOPMOST` if something took it away.
@@ -349,13 +384,20 @@ impl LayeredWindow {
         }
     }
 
-    /// `'static` because the pointer is parked in the window's context, which
+    /// `'static` because the pointers are parked in the window's context, which
     /// outlives any borrow: the handler is an owned `App`, not a borrow of one.
     pub fn run_message_loop(&mut self, handler: &mut (dyn WindowEvents + 'static)) {
-        // The raw pointer is derived here and the `&mut` is not used again until
-        // the loop returns, so the `wndproc`'s reborrow is the only live one.
+        // Both pointers are published from here and `self` is not touched once
+        // dispatching starts, so nothing the `wndproc` sees outlives this scope.
+        let window: *mut LayeredWindow = self;
         let handler_pointer: *mut (dyn WindowEvents + 'static) = handler;
-        self.context.handler.set(Some(handler_pointer));
+        let context = self.context;
+        // SAFETY: `context` is this window's live message state, and `window`
+        // points at the window the loop is running for.
+        unsafe {
+            (*context).window.set(window);
+            (*context).handler.set(Some(handler_pointer));
+        }
 
         let mut message = MSG::default();
         loop {
@@ -373,14 +415,19 @@ impl LayeredWindow {
             }
         }
 
-        self.context.handler.set(None);
+        // SAFETY: as above. Clearing makes the loop's scope the callback's
+        // outermost extent, so a callback can never be invoked after it returns.
+        unsafe {
+            (*context).window.set(std::ptr::null_mut());
+            (*context).handler.set(None);
+        }
     }
 
     pub fn destroy(self) {
         // SAFETY: every handle here was created in `create` and is released
         // exactly once, because `destroy` consumes `self`.
         unsafe {
-            if !self.context.destroyed.get() {
+            if !self.state().destroyed.get() {
                 let _ = DestroyWindow(self.hwnd);
             }
             // Deselecting before deleting: a bitmap selected into a DC cannot
@@ -532,15 +579,22 @@ fn reassert_topmost_if_lost(hwnd: HWND) {
     log::info!("window: topmost was lost (exstyle {style:#010x}); re-asserted");
 }
 
-/// Calls `event` with the owner's handler, if a message loop is running.
-fn dispatch(
+/// Calls `event` with the owner's handler and the window, if a loop is running.
+///
+/// # Safety
+///
+/// `host` and `window` must both be the pointers `run_message_loop` published
+/// for this thread; that publication is the only way either is non-null, and the
+/// loop clears them before its scope ends.
+unsafe fn dispatch(
     host: Option<*mut (dyn WindowEvents + 'static)>,
-    event: impl FnOnce(&mut dyn WindowEvents),
+    window: *mut LayeredWindow,
+    event: impl FnOnce(&mut dyn WindowEvents, &mut LayeredWindow),
 ) {
-    if let Some(pointer) = host {
-        // SAFETY: derived from the caller's `&mut dyn WindowEvents` in
-        // `run_message_loop`, which does not touch it while the loop runs.
-        unsafe { event(&mut *pointer) }
+    if let Some(host) = host {
+        if !window.is_null() {
+            event(&mut *host, &mut *window);
+        }
     }
 }
 
@@ -552,11 +606,15 @@ unsafe extern "system" fn wndproc(
 ) -> LRESULT {
     // Before `create` stores the context — and for any window of this class we
     // did not create — there is nothing to dispatch to.
-    let context = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const MessageContext;
-    let Some(context) = (unsafe { context.as_ref() }) else {
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut MessageContext;
+    if pointer.is_null() {
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
-    };
+    }
+    // SAFETY: published in `create` from a mutable borrow, and cleared only when
+    // the window itself is gone.
+    let context = unsafe { &mut *pointer };
     let host = context.handler.get();
+    let window = context.window.get();
 
     match message {
         WM_PAINT => {
@@ -573,7 +631,9 @@ unsafe extern "system" fn wndproc(
         WM_ERASEBKGND => LRESULT(1),
         WM_TIMER => {
             match wparam.0 {
-                TIMER_TICK => dispatch(host, |handler| handler.on_tick()),
+                TIMER_TICK => unsafe {
+                    dispatch(host, window, |handler, window| handler.on_tick(window))
+                },
                 TIMER_REASSERT => reassert_topmost_if_lost(hwnd),
                 TIMER_CLOSE_AFTER => {
                     // SAFETY: one-shot; the timer is ours and `hwnd` is alive.
@@ -588,18 +648,26 @@ unsafe extern "system" fn wndproc(
         }
         // `WM_APP + 1` is the wake-up the HTTP thread posts (spec §12).
         m if m == WM_APP + 1 => {
-            dispatch(host, |handler| handler.on_wake());
+            unsafe { dispatch(host, window, |handler, window| handler.on_wake(window)) };
             LRESULT(0)
         }
         WM_DPICHANGED => {
             // High word is the Y DPI; PerMonitorV2 keeps both equal.
             let dpi = (wparam.0 & 0xFFFF) as u32;
             context.dpi.set(dpi);
-            dispatch(host, |handler| handler.on_dpi_changed(dpi));
+            unsafe {
+                dispatch(host, window, |handler, window| {
+                    handler.on_dpi_changed(window, dpi)
+                })
+            };
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
-            dispatch(host, |handler| handler.on_display_change());
+            unsafe {
+                dispatch(host, window, |handler, window| {
+                    handler.on_display_change(window)
+                })
+            };
             LRESULT(0)
         }
         WM_SETCURSOR => {
@@ -624,7 +692,11 @@ unsafe extern "system" fn wndproc(
         }
         WM_DESTROY => {
             context.destroyed.set(true);
-            dispatch(host, |handler| handler.on_quit_requested());
+            unsafe {
+                dispatch(host, window, |handler, window| {
+                    handler.on_quit_requested(window)
+                })
+            };
             // SAFETY: ends the message loop.
             unsafe { PostQuitMessage(0) };
             LRESULT(0)

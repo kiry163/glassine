@@ -2,11 +2,11 @@
 
 #![windows_subsystem = "windows"]
 
+use glassine::app::App;
 use glassine::config::{Config, Overrides};
-use glassine::geometry::resolve_rect;
 use glassine::logging;
-use glassine::platform::win::{self, LayeredWindow, WindowEvents};
-use glassine::render;
+use glassine::platform::win::{self, LayeredWindow};
+use glassine::window_state;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -53,28 +53,34 @@ fn run(raw: &[String]) -> Result<(), String> {
         config.server.port
     );
 
+    let state_path = window_state::state_path();
     if args.check_config {
-        print!("{}", report(&config, &path));
+        print!("{}", report(&config, &path, &state_path));
         return Ok(());
     }
 
-    run_window(&config, args.smoke_ms)
+    run_window(config, state_path, args.smoke_ms)
 }
 
-fn run_window(config: &Config, smoke_ms: Option<u64>) -> Result<(), String> {
+fn run_window(config: Config, state_path: PathBuf, smoke_ms: Option<u64>) -> Result<(), String> {
     let monitors = win::enumerate_monitors();
     let (work_area, device_name) = win::resolve_work_area(&config.window.monitor, &monitors);
-    let rect = resolve_rect(
+
+    // Spec 10.4: a saved origin outranks the configured anchor, and the log
+    // records which of the two won.
+    let saved = window_state::load(&state_path);
+    let (rect, source) = window_state::resolve(
         config.window.anchor,
         config.window.offset,
         config.window.size,
         work_area,
+        saved,
     );
 
-    let mut window = LayeredWindow::create(&config.window, rect)
+    let window = LayeredWindow::create(&config.window, rect)
         .map_err(|error| format!("cannot create the window: {error}"))?;
     log::info!(
-        "window created hwnd={:?} dpi={} monitor={} work_area={},{},{},{} rect={},{},{},{}",
+        "window created hwnd={:?} dpi={} monitor={} work_area={},{},{},{} rect={},{},{},{} position_source={:?}",
         window.hwnd(),
         window.dpi(),
         device_name,
@@ -85,45 +91,23 @@ fn run_window(config: &Config, smoke_ms: Option<u64>) -> Result<(), String> {
         rect.x,
         rect.y,
         rect.width,
-        rect.height
+        rect.height,
+        source
     );
 
-    if let Some(milliseconds) = smoke_ms {
-        window.close_after(milliseconds as u32);
+    let mut app = App::new(config, window, state_path);
+    let tick_ms = app.tick_interval_ms();
+    if let Some(window) = app.window_mut() {
+        window.set_tick_interval(tick_ms);
+        if let Some(milliseconds) = smoke_ms {
+            window.close_after(milliseconds as u32);
+        }
     }
 
-    // Until the application exists this frame is blank, i.e. the window is
-    // fully transparent and only its geometry is being exercised.
-    render::clear(window.pixels_mut());
-    if let Err(error) = window.present() {
-        log::error!("present failed: {error}");
-        return Err(format!("cannot present the first frame: {error}"));
-    }
-    log::info!("presented frame {}x{}", rect.width, rect.height);
-
-    window.run_message_loop(&mut IdleEvents);
-    window.destroy();
+    app.redraw();
+    app.run();
+    app.shutdown();
     Ok(())
-}
-
-/// Stands in for the application until it exists: the window needs a handler,
-/// and there is no content to draw or commands to receive yet.
-struct IdleEvents;
-
-impl WindowEvents for IdleEvents {
-    fn on_tick(&mut self) {}
-
-    fn on_wake(&mut self) {}
-
-    fn on_dpi_changed(&mut self, dpi: u32) {
-        log::info!("window: dpi changed to {dpi}");
-    }
-
-    fn on_display_change(&mut self) {
-        log::info!("window: display configuration changed");
-    }
-
-    fn on_quit_requested(&mut self) {}
 }
 
 fn parse_args(raw: &[String]) -> Result<Args, String> {
@@ -183,14 +167,15 @@ fn resolve(args: &Args) -> Result<(Config, PathBuf), String> {
     Ok((config, path))
 }
 
-fn report(config: &Config, path: &Path) -> String {
+fn report(config: &Config, path: &Path, state_path: &Path) -> String {
     let monitors = win::enumerate_monitors();
     let (work_area, device_name) = win::resolve_work_area(&config.window.monitor, &monitors);
-    let rect = resolve_rect(
+    let (rect, source) = window_state::resolve(
         config.window.anchor,
         config.window.offset,
         config.window.size,
         work_area,
+        window_state::load(state_path),
     );
 
     let mut out = String::new();
@@ -202,8 +187,15 @@ fn report(config: &Config, path: &Path) -> String {
     );
     let _ = writeln!(
         out,
-        "rect={},{},{},{} position_source=config",
-        rect.x, rect.y, rect.width, rect.height
+        "rect={},{},{},{} position_source={}",
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        match source {
+            window_state::PositionSource::Config => "config",
+            window_state::PositionSource::Override => "override",
+        }
     );
     let _ = writeln!(out, "port={}", config.server.port);
     let _ = writeln!(out, "font={}", config.text.family);
