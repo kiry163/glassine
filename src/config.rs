@@ -514,25 +514,18 @@ fn parse_color(value: &str) -> Result<Rgb, ConfigError> {
     Ok(Rgb { r: byte(0), g: byte(2), b: byte(4) })
 }
 
-/// A strftime template must be non-empty and must not end with a dangling `%`.
-/// Whether the specifiers themselves are supported is decided where the
-/// template is formatted, not here.
+/// A strftime template must be non-empty and must parse.
+///
+/// Parsing up front is what turns an unsupported specifier into a startup
+/// failure with a field name, instead of a failure the first time the clock
+/// tries to format itself.
 fn validate_clock_format(value: &str) -> Result<(), ConfigError> {
     if value.is_empty() {
         return Err(ConfigError::new("clock.format", "must not be empty"));
     }
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 1 >= bytes.len() {
-            return Err(ConfigError::new(
-                "clock.format",
-                "ends with a dangling '%'",
-            ));
-        }
-        index += 1;
-    }
-    Ok(())
+    time::format_description::parse_strftime_owned(value)
+        .map(|_| ())
+        .map_err(|error| ConfigError::new("clock.format", error.to_string()))
 }
 
 /// Accepts `"local"` or `±HH:MM`.
@@ -606,6 +599,7 @@ mod tests {
             ("[text]\nsize = 0\n", "text.size"),
             ("[clock]\nformat = \"\"\n", "clock.format"),
             ("[clock]\nformat = \"%\"\n", "clock.format"),
+            ("[clock]\nformat = \"%Q\"\n", "clock.format"),
             ("[clock]\nutc_offset = \"+8\"\n", "clock.utc_offset"),
             ("[server]\nport = 0\n", "server.port"),
             ("[server]\nport = 70000\n", "server.port"),
