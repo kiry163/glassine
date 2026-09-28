@@ -231,13 +231,18 @@ impl LayeredWindow {
     }
 
     /// The message state, reached through the one pointer that owns it.
-    fn state(&self) -> &mut MessageContext {
+    ///
+    /// Shared, not mutable: every mutable field is a `Cell`, which is what makes
+    /// interior mutation legitimate here. Returning `&mut` from `&self` would be
+    /// unsound, and it would also claim exclusive access this type does not have
+    /// — the `wndproc` mutates the same cells at the same time.
+    fn state(&self) -> &MessageContext {
         // SAFETY: `context` points into the boxed state this window owns, which
         // lives until `destroy` consumes the window. Every access — here and in
         // the `wndproc` — uses that same pointer, so no second borrow of that
         // state can exist. The window's own fields live in a different
         // allocation, so borrowing them does not disturb this one.
-        unsafe { &mut *self.context }
+        unsafe { &*self.context }
     }
 
     pub fn hwnd(&self) -> HWND {
@@ -611,8 +616,9 @@ unsafe extern "system" fn wndproc(
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     // SAFETY: published in `create` from a mutable borrow, and cleared only when
-    // the window itself is gone.
-    let context = unsafe { &mut *pointer };
+    // the window itself is gone. Shared, because every field it exposes is a
+    // `Cell` and mutation goes through those.
+    let context = unsafe { &*pointer };
     let host = context.handler.get();
     let window = context.window.get();
 
