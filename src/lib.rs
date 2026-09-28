@@ -12,4 +12,5 @@ pub mod content;
 pub mod geometry;
 pub mod logging;
 pub mod platform;
+pub mod render;
 pub mod window_state;
