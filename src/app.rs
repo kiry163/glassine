@@ -3,9 +3,12 @@
 
 use crate::config::Config;
 use crate::content::{Clock, Command, ContentState, Mode};
+use crate::geometry::Rect;
 use crate::layout::{PlacedGlyph, TextEngine};
 use crate::platform::win::{LayeredWindow, WindowEvents};
 use crate::render;
+use crate::status::StatusSnapshot;
+use crate::window_state::PositionSource;
 use std::borrow::Cow;
 use std::path::PathBuf;
 
@@ -14,13 +17,6 @@ use std::path::PathBuf;
 pub struct RedrawOutcome {
     /// Whether content did not fit and was cut off.
     pub truncated: bool,
-}
-
-/// What `GET /status` will report, without reaching into the app's innards.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StatusSnapshot {
-    pub mode: Mode,
-    pub text_bytes: usize,
 }
 
 pub struct App {
@@ -39,6 +35,11 @@ pub struct App {
     window: Option<LayeredWindow>,
     presented_once: bool,
     stopped: bool,
+    /// Whether the last layout truncated, kept so `/status` can report it
+    /// without replaying the render.
+    last_truncated: bool,
+    /// Which authority placed the window, on the snapshot's advice.
+    position_source: PositionSource,
 }
 
 impl App {
@@ -56,7 +57,7 @@ impl App {
         let state = ContentState::new();
         let clock = Clock::from_config(&config.clock);
         let engine = TextEngine::new(&config.text);
-        let status = StatusSnapshot { mode: state.mode(), text_bytes: state.text().len() };
+        let status = snapshot_of(&config, &state, window.as_ref(), PositionSource::Config, false);
 
         App {
             config,
@@ -69,7 +70,16 @@ impl App {
             window,
             presented_once: false,
             stopped: false,
+            last_truncated: false,
+            position_source: PositionSource::Config,
         }
+    }
+
+    /// Records which authority placed the window, so `/status` can explain why
+    /// it is where it is.
+    pub fn set_position_source(&mut self, source: PositionSource) {
+        self.position_source = source;
+        self.refresh_status();
     }
 
     pub fn status(&self) -> &StatusSnapshot {
@@ -116,6 +126,8 @@ impl App {
 
         render::apply_opacity(buffer, self.config.window.opacity);
         render::rgba_to_bgra_in_place(buffer);
+        self.last_truncated = truncated;
+        self.refresh_status();
         RedrawOutcome { truncated }
     }
 
@@ -188,10 +200,49 @@ impl App {
     }
 
     fn refresh_status(&mut self) {
-        self.status = StatusSnapshot {
-            mode: self.state.mode(),
-            text_bytes: self.state.text().len(),
-        };
+        let status = snapshot_of(
+            &self.config,
+            &self.state,
+            self.window.as_ref(),
+            self.position_source,
+            self.last_truncated,
+        );
+        self.status = status;
+    }
+}
+
+/// Builds the snapshot from the pieces, so construction and every later refresh
+/// cannot drift apart.
+fn snapshot_of(
+    config: &Config,
+    state: &ContentState,
+    window: Option<&LayeredWindow>,
+    position_source: PositionSource,
+    last_truncated: bool,
+) -> StatusSnapshot {
+    let (window_rect, monitor_name, dpi) = match window {
+        Some(window) => (window.rect(), window.monitor_name(), window.dpi()),
+        // Headless: no window to measure, so the configured size at the origin
+        // is the only honest answer, and there is no monitor to name.
+        None => (
+            Rect { x: 0, y: 0, width: config.window.size.0, height: config.window.size.1 },
+            String::new(),
+            0,
+        ),
+    };
+
+    StatusSnapshot {
+        mode: state.mode(),
+        window: window_rect,
+        monitor_name,
+        dpi,
+        // The spec pins this to `false` outside text mode: a truncated clock
+        // line is not caller content going missing.
+        truncated: state.mode() == Mode::Text && last_truncated,
+        // `ContentState` clears the text whenever it leaves text mode, so this
+        // is 0 in time and blank mode by construction.
+        text_bytes: state.text().len(),
+        position_source,
     }
 }
 

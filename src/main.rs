@@ -96,6 +96,7 @@ fn run_window(config: Config, state_path: PathBuf, smoke_ms: Option<u64>) -> Res
     );
 
     let mut app = App::new(config, window, state_path);
+    app.set_position_source(source);
     let tick_ms = app.tick_interval_ms();
     if let Some(window) = app.window_mut() {
         window.set_tick_interval(tick_ms);

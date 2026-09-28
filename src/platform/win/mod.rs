@@ -249,8 +249,12 @@ impl LayeredWindow {
         self.hwnd
     }
 
+    /// The window's current rectangle. The origin is read live, so a drag shows
+    /// up here; the size is the configured one, which nothing changes after
+    /// creation.
     pub fn rect(&self) -> Rect {
-        self.rect
+        let (x, y) = self.origin();
+        Rect { x, y, ..self.rect }
     }
 
     pub fn origin(&self) -> (i32, i32) {
