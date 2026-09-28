@@ -7,4 +7,6 @@
 //! The library target exists so each module's public surface is externally
 //! visible rather than dead code until a later task wires it up.
 
+pub mod config;
 pub mod geometry;
+pub mod platform;
