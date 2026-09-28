@@ -11,8 +11,10 @@ use std::fmt;
 use std::mem::size_of;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    CloseHandle, COLORREF, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM,
+    LRESULT, POINT, RECT, SIZE, WPARAM,
 };
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
     EnumDisplayMonitors, GetDC, GetMonitorInfoW, MonitorFromWindow, ReleaseDC, SelectObject,
@@ -20,20 +22,29 @@ use windows::Win32::Graphics::Gdi::{
     HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, PAINTSTRUCT, AC_SRC_ALPHA, AC_SRC_OVER,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage,
-    RegisterClassW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+    GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, LoadIconW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SetCursor, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW,
-    GWL_EXSTYLE, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, MONITORINFOF_PRIMARY, MSG,
+    GWL_EXSTYLE, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL,
+    MONITORINFOF_PRIMARY, MSG,
     SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, ULW_ALPHA, WM_APP, WM_CLOSE,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_PAINT, WM_SETCURSOR, WM_TIMER,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER,
     WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     WS_POPUP,
 };
 
+pub mod autostart;
+pub mod tray;
+
 const CLASS_NAME: PCWSTR = w!("GlassineWindow");
+/// The class of the message-only window the tray icon lives on.
+const TRAY_CLASS_NAME: PCWSTR = w!("GlassineTrayWindow");
 const WINDOW_TITLE: PCWSTR = w!("glassine");
 
 /// Window style mask, fixed by Global Constraints (exstyle `0x0808_00A8`).
@@ -46,6 +57,7 @@ const WINDOW_EX_STYLE_MASK: u32 = WS_EX_LAYERED.0
 const TIMER_TICK: usize = 1;
 const TIMER_REASSERT: usize = 2;
 const TIMER_CLOSE_AFTER: usize = 3;
+const TIMER_MOVE_CHECK: usize = 4;
 
 /// The icon resource id `winresource` assigns to `assets/glassine.ico`.
 const ICON_RESOURCE_ID: u16 = 1;
@@ -104,6 +116,57 @@ pub trait WindowEvents {
     /// The window is being destroyed; release anything tied to its lifetime,
     /// such as the tray icon.
     fn on_quit_requested(&mut self, window: &mut LayeredWindow);
+    /// A drag ended while in move mode. `position` is where the drag left the
+    /// window, or `None` when it did not move.
+    fn on_drag_finished(&mut self, window: &mut LayeredWindow, position: Option<(i32, i32)>);
+    /// The user clicked the tray icon.
+    fn on_tray(&mut self, window: &mut LayeredWindow, action: tray::TrayAction);
+}
+
+/// The screen position `present` draws the surface at.
+///
+/// A value with the operations that move it, rather than a bare pair: the
+/// window's own position and this one have to move together, and the bug this
+/// type exists to make visible is a path that moves only one of them — `present`
+/// then yanks the window back on the next frame (spec §7.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentTarget {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl PresentTarget {
+    pub fn move_to(&mut self, x: i32, y: i32) {
+        self.x = x;
+        self.y = y;
+    }
+
+    pub fn move_by(&mut self, dx: i32, dy: i32) {
+        self.x += dx;
+        self.y += dy;
+    }
+}
+
+/// Where a finished drag should leave the window, or `None` when it did not
+/// move.
+///
+/// A click without movement is not a drag: remembering one would hand the window
+/// to an override the user never asked for, and the configured anchor would stop
+/// applying (spec §10.4, §15.3 D5).
+pub fn commit_position(before: (i32, i32), after: (i32, i32)) -> Option<(i32, i32)> {
+    if before == after {
+        None
+    } else {
+        Some(after)
+    }
+}
+
+/// A drag in progress: where the window sat when the button went down, and where
+/// inside the window the cursor took hold.
+#[derive(Clone, Copy)]
+struct Drag {
+    origin: (i32, i32),
+    grab: (i32, i32),
 }
 
 /// Window state the `wndproc` owns and mutates.
@@ -116,16 +179,24 @@ struct MessageContext {
     handler: Cell<Option<*mut (dyn WindowEvents + 'static)>>,
     /// The origin `present` draws at. Also the authority `set_position`
     /// updates, so the two cannot drift apart.
-    origin: Cell<(i32, i32)>,
+    origin: Cell<PresentTarget>,
     dpi: Cell<u32>,
     destroyed: Cell<bool>,
     move_mode: Cell<bool>,
     click_through: Cell<bool>,
+    drag: Cell<Option<Drag>>,
+    /// Whether the `--smoke-move-ms` check found the window away from its
+    /// presentation target.
+    move_check_failed: Cell<bool>,
 }
 
 /// The layered popup and its DIB surface.
 pub struct LayeredWindow {
     hwnd: HWND,
+    /// Message-only window for the tray icon. Separate because dismissing its
+    /// menu needs `SetForegroundWindow`, which `WS_EX_NOACTIVATE` refuses on the
+    /// note's own window (spec §11).
+    tray_window: HWND,
     screen_dc: HDC,
     mem_dc: HDC,
     bitmap: HBITMAP,
@@ -178,16 +249,48 @@ impl LayeredWindow {
             let mut context = Box::new(MessageContext {
                 window: Cell::new(std::ptr::null_mut()),
                 handler: Cell::new(None),
-                origin: Cell::new((rect.x, rect.y)),
+                origin: Cell::new(PresentTarget { x: rect.x, y: rect.y }),
                 dpi: Cell::new(GetDpiForWindow(hwnd)),
                 destroyed: Cell::new(false),
                 move_mode: Cell::new(false),
                 click_through: Cell::new(true),
+                drag: Cell::new(None),
+                move_check_failed: Cell::new(false),
             });
             // Derived from a mutable borrow, so later writes through it — the
             // `wndproc`'s included — are legitimate.
             let context_pointer: *mut MessageContext = &mut *context;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, context_pointer as isize);
+
+            let tray_class = WNDCLASSW {
+                lpfnWndProc: Some(tray_wndproc),
+                hInstance: instance,
+                lpszClassName: TRAY_CLASS_NAME,
+                ..Default::default()
+            };
+            // As above: a repeat registration fails harmlessly.
+            RegisterClassW(&tray_class);
+            // An ordinary hidden window, not a message-only one: dismissing the
+            // popup menu needs `SetForegroundWindow`, and a window parented to
+            // HWND_MESSAGE cannot be made foreground, so its menu closes the
+            // instant it opens. `WS_EX_TOOLWINDOW` keeps this one out of the
+            // taskbar and Alt-Tab, and it is never shown.
+            let tray_window = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                TRAY_CLASS_NAME,
+                WINDOW_TITLE,
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )?;
+            // The same context: the tray's window reports to the same handler.
+            SetWindowLongPtrW(tray_window, GWLP_USERDATA, context_pointer as isize);
 
             let screen_dc = GetDC(None);
             let mem_dc = CreateCompatibleDC(Some(screen_dc));
@@ -218,6 +321,7 @@ impl LayeredWindow {
 
             Ok(LayeredWindow {
                 hwnd,
+                tray_window,
                 screen_dc,
                 mem_dc,
                 bitmap,
@@ -249,6 +353,11 @@ impl LayeredWindow {
         self.hwnd
     }
 
+    /// The message-only window the tray icon attaches to.
+    pub fn tray_window(&self) -> HWND {
+        self.tray_window
+    }
+
     /// The window's current rectangle. The origin is read live, so a drag shows
     /// up here; the size is the configured one, which nothing changes after
     /// creation.
@@ -258,7 +367,8 @@ impl LayeredWindow {
     }
 
     pub fn origin(&self) -> (i32, i32) {
-        self.state().origin.get()
+        let target = self.state().origin.get();
+        (target.x, target.y)
     }
 
     pub fn dpi(&self) -> u32 {
@@ -291,10 +401,10 @@ impl LayeredWindow {
     }
 
     pub fn present(&mut self) -> Result<(), PlatformError> {
-        let (x, y) = self.state().origin.get();
+        let target = self.state().origin.get();
         let size = SIZE { cx: self.rect.width as i32, cy: self.rect.height as i32 };
         let source = POINT { x: 0, y: 0 };
-        let destination = POINT { x, y };
+        let destination = POINT { x: target.x, y: target.y };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -325,7 +435,9 @@ impl LayeredWindow {
     /// `WindowFromPoint` read the window's own position. Updating only one of
     /// them makes the next redraw yank the window back.
     pub fn set_position(&mut self, x: i32, y: i32) {
-        self.state().origin.set((x, y));
+        let mut target = self.state().origin.get();
+        target.move_to(x, y);
+        self.state().origin.set(target);
         // SAFETY: `hwnd` is alive, and the flags keep size, z-order and focus
         // untouched.
         unsafe {
@@ -339,6 +451,45 @@ impl LayeredWindow {
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+    }
+
+    /// Enters move mode (spec §7.2): the window stops passing clicks through, so
+    /// the user can grab it. The style change only takes effect together with
+    /// `SWP_FRAMECHANGED` — without it the hit test keeps using the old style and
+    /// the window stays undraggable.
+    pub fn begin_move_mode(&mut self) {
+        self.set_click_through(false);
+        self.state().move_mode.set(true);
+        log::info!("move mode entered");
+    }
+
+    /// Leaves move mode and passes clicks through again.
+    pub fn end_move_mode(&mut self) {
+        self.state().move_mode.set(false);
+        self.set_click_through(true);
+        log::info!("move mode left");
+    }
+
+    pub fn is_move_mode(&self) -> bool {
+        self.state().move_mode.get()
+    }
+
+    /// Arms the `--smoke-move-ms` verdict: once `milliseconds` have passed,
+    /// compare the window's own position with the target `present` uses, record
+    /// the answer, and close.
+    ///
+    /// A redraw must move neither, so a disagreement here means a path moved one
+    /// of the two authorities and the next frame would yank the window back
+    /// (spec §15.3 D9).
+    pub fn check_move_after(&mut self, milliseconds: u32) {
+        // SAFETY: `hwnd` is alive and the timer id is ours.
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_MOVE_CHECK, milliseconds.max(1), None);
+        }
+    }
+
+    pub fn move_check_failed(&self) -> bool {
+        self.state().move_check_failed.get()
     }
 
     pub fn set_click_through(&mut self, enabled: bool) {
@@ -439,6 +590,7 @@ impl LayeredWindow {
             if !self.state().destroyed.get() {
                 let _ = DestroyWindow(self.hwnd);
             }
+            let _ = DestroyWindow(self.tray_window);
             // Deselecting before deleting: a bitmap selected into a DC cannot
             // be deleted.
             let _ = SelectObject(self.mem_dc, self.old_bitmap);
@@ -670,6 +822,31 @@ unsafe extern "system" fn wndproc(
                         let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                     }
                 }
+                TIMER_MOVE_CHECK => {
+                    // SAFETY: one-shot; the timer is ours and `hwnd` is alive.
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), TIMER_MOVE_CHECK);
+                    }
+                    let mut rect = RECT::default();
+                    // SAFETY: `rect` is a valid out-parameter and `hwnd` is
+                    // alive.
+                    let available = unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok();
+                    let target = context.origin.get();
+                    if !available || (rect.left, rect.top) != (target.x, target.y) {
+                        context.move_check_failed.set(true);
+                        log::error!(
+                            "smoke: window at {},{} but present targets {},{}",
+                            rect.left,
+                            rect.top,
+                            target.x,
+                            target.y
+                        );
+                    }
+                    // SAFETY: ends the run the same way closing it by hand does.
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -696,6 +873,61 @@ unsafe extern "system" fn wndproc(
                     handler.on_display_change(window)
                 })
             };
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN if context.move_mode.get() => {
+            // Grabbing the capture is what keeps the drag alive once the cursor
+            // leaves the window — which it does as soon as the drag starts.
+            let mut cursor = POINT::default();
+            // SAFETY: `cursor` is a valid out-parameter.
+            unsafe {
+                let _ = GetCursorPos(&mut cursor);
+            }
+            let target = context.origin.get();
+            context.drag.set(Some(Drag {
+                origin: (target.x, target.y),
+                grab: (cursor.x - target.x, cursor.y - target.y),
+            }));
+            // SAFETY: `hwnd` is alive.
+            unsafe {
+                let _ = SetCapture(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE if context.move_mode.get() => {
+            if let Some(drag) = context.drag.get() {
+                let mut cursor = POINT::default();
+                // SAFETY: `cursor` is a valid out-parameter.
+                unsafe {
+                    let _ = GetCursorPos(&mut cursor);
+                }
+                if !window.is_null() {
+                    // SAFETY: `window` is the pointer `run_message_loop`
+                    // published, and the loop does not touch the window once
+                    // dispatching starts.
+                    let window = unsafe { &mut *window };
+                    window.set_position(cursor.x - drag.grab.0, cursor.y - drag.grab.1);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP if context.move_mode.get() => {
+            let drag = context.drag.take();
+            // SAFETY: `hwnd` is alive and the capture is ours.
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            if let Some(drag) = drag {
+                let target = context.origin.get();
+                // SAFETY: `host` and `window` are the pointers `dispatch`
+                // documents.
+                unsafe {
+                    dispatch(host, window, |handler, window| {
+                        let moved = commit_position(drag.origin, (target.x, target.y));
+                        handler.on_drag_finished(window, moved);
+                    })
+                };
+            }
             LRESULT(0)
         }
         WM_SETCURSOR => {
@@ -733,9 +965,91 @@ unsafe extern "system" fn wndproc(
     }
 }
 
+/// The message-only window's procedure: it exists to receive tray callbacks and
+/// to own the popup menu.
+unsafe extern "system" fn tray_wndproc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut MessageContext;
+    if pointer.is_null() {
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+    }
+    // SAFETY: published in `create`, cleared only when the window is gone.
+    let context = unsafe { &*pointer };
+
+    if message == tray::TRAY_CALLBACK_MESSAGE {
+        // The mouse message that caused the callback arrives in `lparam`.
+        if let Some(action) = tray::tray_message_action(lparam.0 as u32) {
+            unsafe {
+                dispatch(context.handler.get(), context.window.get(), |handler, window| {
+                    handler.on_tray(window, action)
+                })
+            };
+        }
+        return LRESULT(0);
+    }
+
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
 fn wide_to_string(wide: &[u16]) -> String {
     let length = wide.iter().position(|&unit| unit == 0).unwrap_or(wide.len());
     String::from_utf16_lossy(&wide[..length])
+}
+
+/// Holding this keeps the single-instance name claimed. The kernel releases it
+/// when the process ends, so no exit path has to remember to.
+pub struct InstanceGuard(HANDLE);
+
+/// Why a second instance must not start.
+#[derive(Debug)]
+pub enum InstanceError {
+    /// Another instance holds the name.
+    AlreadyRunning,
+    /// The mutex could not be created at all.
+    Failed(PlatformError),
+}
+
+impl fmt::Display for InstanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InstanceError::AlreadyRunning => f.write_str("已有实例在运行"),
+            InstanceError::Failed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// Claims `Glassine.SingleInstance` (spec 12).
+pub fn acquire_single_instance() -> Result<InstanceGuard, InstanceError> {
+    // SAFETY: the name is a literal that outlives the call, and a null
+    // attributes pointer asks for the default security descriptor.
+    unsafe {
+        match CreateMutexW(None, false, w!("Glassine.SingleInstance")) {
+            Ok(handle) => {
+                // CreateMutexW succeeds when the name already exists too; the
+                // last error is what separates "created" from "opened".
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    let _ = CloseHandle(handle);
+                    Err(InstanceError::AlreadyRunning)
+                } else {
+                    Ok(InstanceGuard(handle))
+                }
+            }
+            Err(error) => Err(InstanceError::Failed(error.into())),
+        }
+    }
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from CreateMutexW and is closed exactly once.
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -787,5 +1101,28 @@ mod monitor_tests {
     fn topmost_is_only_reasserted_when_the_style_was_lost() {
         assert!(!needs_topmost_reassert(0x0808_00A8));
         assert!(needs_topmost_reassert(0x0808_00A8 & !0x0000_0008));
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use super::*;
+
+    #[test]
+    fn a_drag_with_no_displacement_does_not_count_as_a_move() {
+        assert_eq!(commit_position((100, 100), (100, 100)), None);
+        assert_eq!(commit_position((100, 100), (101, 100)), Some((101, 100)));
+        assert_eq!(commit_position((100, 100), (100, 101)), Some((100, 101)));
+    }
+
+    #[test]
+    fn the_present_target_follows_the_window() {
+        // The invariant that would silently snap the window back: present() uses
+        // the cached target as UpdateLayeredWindow's destination.
+        let mut target = PresentTarget { x: 100, y: 100 };
+        target.move_to(400, 250);
+        assert_eq!((target.x, target.y), (400, 250));
+        target.move_by(10, -10);
+        assert_eq!((target.x, target.y), (410, 240));
     }
 }

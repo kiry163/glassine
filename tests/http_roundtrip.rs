@@ -3,13 +3,19 @@ use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+mod common;
+
 struct Harness {
     child: Child,
     port: u16,
+    /// Held for as long as the instance runs: the product allows one instance per
+    /// machine, so no other test may start one meanwhile.
+    _turn: common::Turn,
 }
 
 impl Harness {
     fn start(port: u16) -> Self {
+        let turn = common::take_turn();
         let dir = std::env::temp_dir().join("glassine-plan-http");
         std::fs::create_dir_all(&dir).unwrap();
         // One file per port: cargo runs these test functions in parallel, and a
@@ -23,7 +29,7 @@ impl Harness {
             .arg(&config)
             .spawn()
             .unwrap();
-        let h = Harness { child, port };
+        let h = Harness { child, port, _turn: turn };
         h.wait_until_listening();
         h
     }

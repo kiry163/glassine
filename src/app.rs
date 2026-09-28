@@ -5,10 +5,11 @@ use crate::config::Config;
 use crate::content::{Clock, Command, ContentState, Mode};
 use crate::geometry::Rect;
 use crate::layout::{PlacedGlyph, TextEngine};
-use crate::platform::win::{LayeredWindow, WindowEvents};
+use crate::platform::win::tray::{self, Tray, TrayAction, TrayEvent};
+use crate::platform::win::{LayeredWindow, PlatformError, WindowEvents};
 use crate::render;
 use crate::status::StatusSnapshot;
-use crate::window_state::PositionSource;
+use crate::window_state::{self, PositionSource, SavedPosition};
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -82,6 +83,8 @@ pub struct App {
     shared_status: Arc<Mutex<StatusSnapshot>>,
     /// What the window last said about itself.
     window_facts: WindowFacts,
+    /// The notification-area icon, once it has been installed.
+    tray: Option<Tray>,
 }
 
 impl App {
@@ -124,7 +127,20 @@ impl App {
             command_sender,
             shared_status,
             window_facts,
+            tray: None,
         }
+    }
+
+    /// Puts the icon in the notification area.
+    ///
+    /// A failure is the caller's to report and survive: without the icon the
+    /// window and the HTTP interface both still work (spec §13).
+    pub fn install_tray(&mut self, tooltip: &str) -> Result<(), PlatformError> {
+        let Some(window) = self.window.as_ref() else {
+            return Ok(());
+        };
+        self.tray = Some(Tray::install(window.tray_window(), tooltip)?);
+        Ok(())
     }
 
     /// The sending half of the command queue, for the HTTP server.
@@ -139,9 +155,18 @@ impl App {
 
     /// Drains the queue the HTTP thread fills, applying commands in arrival
     /// order (spec 9.4: a later caller wins).
-    pub fn apply_pending_commands(&mut self) {
+    ///
+    /// The window arrives as a parameter because the message loop owns it while
+    /// it runs — `self.window` is `None` for exactly that stretch — and `Quit`
+    /// has to close it. Reading the window off `self` here silently does nothing,
+    /// which is what a `/quit` that returns 200 and leaves the process running
+    /// looks like.
+    pub fn apply_pending_commands(&mut self, window: &mut LayeredWindow) {
         while let Ok(command) = self.commands.try_recv() {
-            self.apply_command(command);
+            if !self.apply_command(command) {
+                window.close();
+                return;
+            }
         }
     }
 
@@ -238,17 +263,47 @@ impl App {
         }
     }
 
-    pub fn apply_command(&mut self, command: Command) {
+    /// Applies one command, and reports whether it was a content command.
+    ///
+    /// `false` means `Quit`: the content state machine refuses it, and carrying
+    /// it out needs a window — which the message loop holds, not this struct.
+    pub fn apply_command(&mut self, command: Command) -> bool {
         if self.state.apply(&command) {
             self.refresh_status();
-            return;
+            return true;
         }
 
         // `Quit` is the one command `apply` refuses.
         self.stopped = true;
-        if let Some(window) = self.window.as_mut() {
-            window.close();
+        false
+    }
+
+    /// Enters move mode (spec §7.2): the tray's first item.
+    pub fn on_move_mode_begin(&mut self, window: &mut LayeredWindow) {
+        window.begin_move_mode();
+    }
+
+    /// Ends move mode, remembering where the drag left the window — unless it did
+    /// not move at all, in which case the configured anchor keeps applying.
+    pub fn on_move_mode_end(&mut self, window: &mut LayeredWindow, position: Option<(i32, i32)>) {
+        window.end_move_mode();
+
+        let Some((x, y)) = position else {
+            return;
+        };
+        match window_state::save(&self.state_path, SavedPosition { x, y }) {
+            Ok(()) => {
+                log::info!("window_state: saved {x},{y} to {}", self.state_path.display())
+            }
+            // Spec §13: the window has already moved, and a failed write must not
+            // undo a move the user made. Record it and keep the new position.
+            Err(error) => log::warn!(
+                "window_state: cannot write {}: {error}",
+                self.state_path.display()
+            ),
         }
+        self.position_source = PositionSource::Override;
+        self.refresh_status();
     }
 
     /// Runs the message loop, driving this instance as the handler.
@@ -327,7 +382,7 @@ impl WindowEvents for App {
     }
 
     fn on_wake(&mut self, window: &mut LayeredWindow) {
-        self.apply_pending_commands();
+        self.apply_pending_commands(window);
         // A wake means work arrived, so redraw now rather than at the next tick:
         // that immediacy is the whole point of the wake-up path.
         if !self.stopped {
@@ -351,6 +406,47 @@ impl WindowEvents for App {
 
     fn on_quit_requested(&mut self, _window: &mut LayeredWindow) {
         self.stopped = true;
+        // Every exit path takes the icon with it, or it lingers as a ghost until
+        // the mouse passes over it (spec §11).
+        if let Some(tray) = self.tray.as_mut() {
+            tray.remove();
+        }
+    }
+
+    fn on_drag_finished(&mut self, window: &mut LayeredWindow, position: Option<(i32, i32)>) {
+        self.on_move_mode_end(window, position);
+    }
+
+    fn on_tray(&mut self, window: &mut LayeredWindow, action: TrayAction) {
+        let Some(tray) = self.tray.as_mut() else {
+            return;
+        };
+        let Some(event) = tray.handle_message(action) else {
+            return;
+        };
+        log::info!("tray: menu chose {event:?}");
+
+        match event {
+            TrayEvent::MoveWindow => self.on_move_mode_begin(window),
+            TrayEvent::OpenConfig => {
+                let path = Config::config_path();
+                match tray::open_config(&path) {
+                    Ok(()) => log::info!("tray: opened {}", path.display()),
+                    Err(error) => {
+                        log::warn!("tray: cannot open {}: {error}", path.display());
+                        // Spec §13 asks for the failure to reach the user through
+                        // the balloon the tray already has, rather than a new GUI
+                        // element.
+                        tray.notify("glassine", &format!("无法打开配置文件：{error}"));
+                    }
+                }
+            }
+            TrayEvent::Quit => {
+                log::info!("tray: quit requested");
+                tray.remove();
+                window.close();
+            }
+        }
     }
 }
 
@@ -378,7 +474,7 @@ mod tests {
     #[test]
     fn text_mode_paints_and_reports_byte_length() {
         let mut app = app_with("[window]\nsize = [320, 120]\n");
-        app.apply_command(crate::content::Command::SetText("玻璃纸".into()));
+        assert!(app.apply_command(crate::content::Command::SetText("玻璃纸".into())));
         let mut buf = vec![0u8; 320 * 120 * 4];
         app.render_into(&mut buf, 320, 120);
 
@@ -389,12 +485,25 @@ mod tests {
     #[test]
     fn blank_mode_paints_nothing() {
         let mut app = app_with("[window]\nsize = [320, 120]\n");
-        app.apply_command(crate::content::Command::SetText(String::new()));
+        assert!(app.apply_command(crate::content::Command::SetText(String::new())));
         let mut buf = vec![0u8; 320 * 120 * 4];
         app.render_into(&mut buf, 320, 120);
 
         assert!(buf.iter().all(|&b| b == 0), "blank mode must leave the surface clear");
         assert_eq!(app.status().mode, crate::content::Mode::Blank);
+    }
+
+    #[test]
+    fn quit_is_not_a_content_command_and_stops_the_app() {
+        let mut app = app_with("[window]\nsize = [320, 120]\n");
+
+        // The return value is the contract with the message loop: `false` means
+        // the caller has to close the window, because only the loop holds one
+        // while it runs.
+        assert!(!app.apply_command(crate::content::Command::Quit));
+        assert!(app.is_stopped());
+        // Quitting changes nothing about the content on the way out.
+        assert_eq!(app.status().mode, crate::content::Mode::Time);
     }
 
     #[test]
