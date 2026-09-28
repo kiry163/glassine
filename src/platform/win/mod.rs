@@ -176,16 +176,18 @@ impl LayeredWindow {
             let screen_dc = GetDC(None);
             let mem_dc = CreateCompatibleDC(Some(screen_dc));
 
-            let mut info = BITMAPINFO::default();
-            info.bmiHeader = BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: rect.width as i32,
-                // Negative height selects a top-down DIB, so row 0 is the top
-                // row and stride is exactly width * 4 with nothing to pad.
-                biHeight: -(rect.height as i32),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: rect.width as i32,
+                    // Negative height selects a top-down DIB, so row 0 is the top
+                    // row and stride is exactly width * 4 with nothing to pad.
+                    biHeight: -(rect.height as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
