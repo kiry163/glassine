@@ -10,6 +10,7 @@
 pub mod config;
 pub mod content;
 pub mod geometry;
+pub mod layout;
 pub mod logging;
 pub mod platform;
 pub mod render;
