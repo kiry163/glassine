@@ -1,0 +1,24 @@
+[package]
+name = "glassine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+] }
+cosmic-text = "0.19"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+log = "0.4"
+time = { version = "0.3", features = ["formatting", "local-offset"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
