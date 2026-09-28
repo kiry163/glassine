@@ -1,12 +1,12 @@
-//! `glassine`: argument handling and the configuration diagnostic.
-//!
-//! The window, HTTP server, and tray arrive in later tasks; this binary's job
-//! today is to resolve configuration exactly the way the app will and to prove
-//! it, via `--check-config`, without creating a window or binding a port.
+//! `glassine`: argument handling, diagnostics, and the window host.
 
-use glassine::config::{Config, MonitorSelector, Overrides};
+#![windows_subsystem = "windows"]
+
+use glassine::config::{Config, Overrides};
 use glassine::geometry::resolve_rect;
 use glassine::logging;
+use glassine::platform::win::{self, LayeredWindow, WindowEvents};
+use glassine::render;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -28,6 +28,9 @@ struct Args {
     port: Option<String>,
     log_level: Option<String>,
     check_config: bool,
+    /// Runs a real window for this many milliseconds, then exits. Exists so a
+    /// test can drive the window without a user.
+    smoke_ms: Option<u64>,
 }
 
 fn run(raw: &[String]) -> Result<(), String> {
@@ -50,8 +53,77 @@ fn run(raw: &[String]) -> Result<(), String> {
         config.server.port
     );
 
-    print!("{}", report(&config, &path));
+    if args.check_config {
+        print!("{}", report(&config, &path));
+        return Ok(());
+    }
+
+    run_window(&config, args.smoke_ms)
+}
+
+fn run_window(config: &Config, smoke_ms: Option<u64>) -> Result<(), String> {
+    let monitors = win::enumerate_monitors();
+    let (work_area, device_name) = win::resolve_work_area(&config.window.monitor, &monitors);
+    let rect = resolve_rect(
+        config.window.anchor,
+        config.window.offset,
+        config.window.size,
+        work_area,
+    );
+
+    let mut window = LayeredWindow::create(&config.window, rect)
+        .map_err(|error| format!("cannot create the window: {error}"))?;
+    log::info!(
+        "window created hwnd={:?} dpi={} monitor={} work_area={},{},{},{} rect={},{},{},{}",
+        window.hwnd(),
+        window.dpi(),
+        device_name,
+        work_area.x,
+        work_area.y,
+        work_area.width,
+        work_area.height,
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height
+    );
+
+    if let Some(milliseconds) = smoke_ms {
+        window.close_after(milliseconds as u32);
+    }
+
+    // Until the application exists this frame is blank, i.e. the window is
+    // fully transparent and only its geometry is being exercised.
+    render::clear(window.pixels_mut());
+    if let Err(error) = window.present() {
+        log::error!("present failed: {error}");
+        return Err(format!("cannot present the first frame: {error}"));
+    }
+    log::info!("presented frame {}x{}", rect.width, rect.height);
+
+    window.run_message_loop(&mut IdleEvents);
+    window.destroy();
     Ok(())
+}
+
+/// Stands in for the application until it exists: the window needs a handler,
+/// and there is no content to draw or commands to receive yet.
+struct IdleEvents;
+
+impl WindowEvents for IdleEvents {
+    fn on_tick(&mut self) {}
+
+    fn on_wake(&mut self) {}
+
+    fn on_dpi_changed(&mut self, dpi: u32) {
+        log::info!("window: dpi changed to {dpi}");
+    }
+
+    fn on_display_change(&mut self) {
+        log::info!("window: display configuration changed");
+    }
+
+    fn on_quit_requested(&mut self) {}
 }
 
 fn parse_args(raw: &[String]) -> Result<Args, String> {
@@ -63,6 +135,14 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--port" => args.port = Some(flag_value(raw, &mut index)?.to_string()),
             "--log-level" => args.log_level = Some(flag_value(raw, &mut index)?.to_string()),
             "--check-config" => args.check_config = true,
+            "--smoke-ms" => {
+                let value = flag_value(raw, &mut index)?;
+                args.smoke_ms = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--smoke-ms needs a number of milliseconds, got {value:?}"))?,
+                );
+            }
             other => eprintln!("glassine: ignoring unknown argument {other}"),
         }
         index += 1;
@@ -104,7 +184,8 @@ fn resolve(args: &Args) -> Result<(Config, PathBuf), String> {
 }
 
 fn report(config: &Config, path: &Path) -> String {
-    let work_area = glassine::platform::primary_work_area();
+    let monitors = win::enumerate_monitors();
+    let (work_area, device_name) = win::resolve_work_area(&config.window.monitor, &monitors);
     let rect = resolve_rect(
         config.window.anchor,
         config.window.offset,
@@ -117,11 +198,7 @@ fn report(config: &Config, path: &Path) -> String {
     let _ = writeln!(
         out,
         "monitor={} work_area={},{},{},{}",
-        monitor_label(&config.window.monitor),
-        work_area.x,
-        work_area.y,
-        work_area.width,
-        work_area.height
+        device_name, work_area.x, work_area.y, work_area.width, work_area.height
     );
     let _ = writeln!(
         out,
@@ -131,16 +208,6 @@ fn report(config: &Config, path: &Path) -> String {
     let _ = writeln!(out, "port={}", config.server.port);
     let _ = writeln!(out, "font={}", config.text.family);
     out
-}
-
-/// A device name only exists once the platform can enumerate monitors (Task 8);
-/// until then the selector is reported as written.
-fn monitor_label(selector: &MonitorSelector) -> String {
-    match selector {
-        MonitorSelector::Primary => "primary".to_string(),
-        MonitorSelector::Index(index) => format!("index:{index}"),
-        MonitorSelector::DeviceName(name) => name.clone(),
-    }
 }
 
 fn mtime(path: &Path) -> String {
